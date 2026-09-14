@@ -1,0 +1,4 @@
+interface:
+  display_name: "UO AIGC Model Image Processor"
+  short_description: "Batch process apparel model-image AIGC tasks from spreadsheets."
+  default_prompt: "Read the spreadsheet task list, classify SKU folder images, choose references, and generate AIGC model images with ToAPIs."
