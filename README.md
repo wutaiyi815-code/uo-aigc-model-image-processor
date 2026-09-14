@@ -10,7 +10,7 @@
 | 类型 | Codex Skill 与 Python 批处理脚本 |
 | 创建时间 | 2026-07-09（源目录时间） |
 | 公开发布整理 | 2026-09-14 |
-| 版本 | 未单独标记语义版本，以 Git 提交为准 |
+| 版本 | `2026.09.14` |
 | 入口 | [SKILL.md](SKILL.md) |
 | 可执行脚本 | [scripts/uo_aigc_batch.py](scripts/uo_aigc_batch.py) |
 | 状态 | 已通过本地静态与非付费流程验证 |
