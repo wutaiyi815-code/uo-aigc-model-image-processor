@@ -9,8 +9,8 @@
 | 名称 | `uo-aigc-model-image-processor` |
 | 类型 | Codex Skill 与 Python 批处理脚本 |
 | 创建时间 | 2026-07-09（源目录时间） |
-| 公开发布整理 | 2026-09-14 |
-| 版本 | `2026.09.14` |
+| 公开发布整理 | 2026-10-09 |
+| 版本 | `2026.10.09` |
 | 入口 | [SKILL.md](SKILL.md) |
 | 可执行脚本 | [scripts/uo_aigc_batch.py](scripts/uo_aigc_batch.py) |
 | 状态 | 已通过本地静态与非付费流程验证 |
@@ -49,8 +49,9 @@
 ### 人工分类文件
 
 - `classify` 生成 `AIGC视觉识别.json` 和同内容的 `aigc_image_analysis.json`。运行 `plan` 或 `generate` 前，当前 SKU 的 `manual_verified` 必须为 `true`。
-- 每张图片应填写 `kind`、`view`、`garment_type`、`fit_notes`、`model_gender`、`pose_notes` 等视觉字段；平铺正反面分别写入 `front_flat` 和 `back_flat`。
-- 未知任务必须在 `custom_steps` 中明确写出每个原子步骤的 `refs`、可选 `refs_from`、简短 `prompt` 和输出 `sets`；缺少完整计划时应停止生成。
+- 每张图片应填写 `kind`、`view`、`shot_scope`、`garment_type`、`fit_notes`、`model_gender`、`pose_notes` 等视觉字段；平铺正反面分别写入 `front_flat` 和 `back_flat`。
+- 未知任务必须在 `custom_steps` 中明确写出每个原子步骤的 `refs`、可选 `refs_from`、简短 `prompt` 和输出 `sets`；半身任务还必须填写 `target_scope=upper_body|lower_body`。缺少完整计划时应停止生成。
+- 复用裤装模特来源时，应在 `source_qc` 中按文件名记录 `manual_verified`、`product_accurate`、`waist_accessory`、`footwear_type` 和裤脚相对鞋筒的位置。带非商品腰带/腰链/外露内裤腰头，或长裤塞进靴筒、高帮鞋筒的来源不能直接用于后续扩图。
 
 ### 严格参考图顺序
 
@@ -58,13 +59,23 @@
 | --- | --- |
 | 试穿或换色 | Figure 1：待编辑模特图；Figure 2：与可见服装面一致的平铺商品图 |
 | 缺失侧面或正面 | Figure 1：产品已经准确的模特图 |
-| 缺失背面 | Figure 1：产品准确的正面模特图；Figure 2：正面平铺图；Figure 3：背面平铺图 |
+| 缺失背面 | Figure 1：经重新视觉确认、产品准确的正面模特图；Figure 2：背面平铺图；禁止加入正面平铺图 |
 | 换成同一个人 | Figure 1：保留动作和构图的目标图；Figure 2：身份参考模特图 |
 | 无现成模特图的首次试穿 | Figure 1：人工确认的 Eagle 全身底图；Figure 2：正面平铺图 |
+| 上装半身图 | 优先对准确全身图做确定性裁切；必须生成时，Figure 1：准确全身模特图；Figure 2：对应正/背面商品图，`target_scope=upper_body` |
+| 下装正面半身图 | Figure 1：准确全身正面模特图；Figure 2：正面商品图，`target_scope=lower_body` |
+| 下装背面半身图 | Figure 1：准确全身背面模特图；Figure 2：背面商品图，`target_scope=lower_body` |
 
 - 下游步骤使用 `refs_from` 时，上一生成结果自动成为 Figure 1，`refs` 中列出的原始图片依次成为 Figure 2 及后续图片。
-- 背面任务若缺少真正的背面平铺图必须暂停，不能拿正面图代替；只有一张平铺图时也必须确认它确实显示所需服装面。
+- 背面任务若缺少真正的背面平铺图必须暂停，不能拿正面图代替；不得把正面平铺图作为第三张参考传入背面生成。
 - 无模特图时，Eagle 底图必须是全身、纯色背景或无影墙，并完成人工性别、造型和批次唯一性核对。
+
+### 新版来源质量与失败回退
+
+- 旧图片、已完成 API 任务或历史 manifest 不能自动视为准确来源；使用前必须按当前规则重新视觉确认。
+- 裤装应记录短裤或长裤属性；长裤输出不得变成短裤，鞋子保持不变，裤脚不得错误塞入或堆叠在靴筒/高帮鞋筒上。
+- 主模型仅在明确终态失败后才允许重新提交；网络、轮询或超时不确定时必须优先使用原任务 ID 恢复，避免重复付费。
+- 主模型三次尝试耗尽后，脚本会写入 `过程文件/AIGC生图回退请求.json`。回退顺序固定为 Codex 内置 image generation，再到 ToAPI `gemini-3.1-flash-image-official`；提示词和参考图顺序不得改变。
 
 ## 环境与依赖
 
@@ -100,6 +111,7 @@ python "<SKILL_DIR>\scripts\uo_aigc_batch.py" --root "<ROOT>" --excel "<TASKS.xl
 - `AIGC任务计划.json`：按依赖排序的原子生成步骤。
 - `AIGC+修改内容+序号`：各 SKU 最终图片。
 - `过程文件/`、`AIGC处理日志_<SKU>.txt` 和 `AIGC批处理汇总.json`：中间过程、恢复及审计记录。
+- `过程文件/AIGC生图回退请求.json`：主模型失败后的提示词、严格参考图顺序、输出位置和回退状态。
 
 默认生图参数是 3:4、2K、600 秒请求超时和最多 3 次尝试。请求前会检查提示词，避免把 SKU、路径、模型名或输出位置发给图像模型。
 
