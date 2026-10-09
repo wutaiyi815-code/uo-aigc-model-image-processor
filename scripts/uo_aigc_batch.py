@@ -24,7 +24,11 @@ CLASS_JSON_ASCII_NAME = "aigc_image_analysis.json"
 SIZE = "3:4"
 RESOLUTION = "2K"
 REQUEST_TIMEOUT = 600
-MAX_RETRIES = 3
+REQUEST_RETRY_COUNT = 2
+REQUEST_ATTEMPTS = 1 + REQUEST_RETRY_COUNT
+GENERATION_RETRY_COUNT = 2
+GENERATION_ATTEMPTS = 1 + GENERATION_RETRY_COUNT
+GEMINI_FALLBACK_MODEL = "gemini-3.1-flash-image-official"
 POLL_INTERVAL = 8
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 SKIP_TERMS = [
@@ -49,7 +53,7 @@ def sanitize_name(text: str) -> str:
 
 def request_with_retry(method: str, url: str, **kwargs) -> requests.Response:
     last_exc = None
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(1, REQUEST_ATTEMPTS + 1):
         try:
             resp = requests.request(method, url, timeout=REQUEST_TIMEOUT, **kwargs)
             if resp.status_code < 500:
@@ -57,9 +61,17 @@ def request_with_retry(method: str, url: str, **kwargs) -> requests.Response:
             last_exc = RuntimeError(f"HTTP {resp.status_code}: {resp.text[:500]}")
         except Exception as exc:
             last_exc = exc
-        if attempt < MAX_RETRIES:
+        if attempt < REQUEST_ATTEMPTS:
             time.sleep(2 * attempt)
-    raise RuntimeError(f"request failed after {MAX_RETRIES} attempts: {last_exc}")
+    raise RuntimeError(f"request failed after {REQUEST_ATTEMPTS} attempts: {last_exc}")
+
+
+class TerminalGenerationError(RuntimeError):
+    """A provider task reached a terminal non-success state."""
+
+    def __init__(self, payload: Any):
+        super().__init__(f"generation reached terminal failure: {payload}")
+        self.payload = payload
 
 
 def safe_json(resp: requests.Response) -> Any:
@@ -236,6 +248,7 @@ def classify_one_image(path: Path, api_key: str, vision_model: str) -> dict[str,
     prompt = (
         "Analyze this apparel image. Return compact JSON with keys: "
         "kind(model|flat|detail|other), view(front|side_3_4|back|unknown), "
+        "shot_scope(full_body|upper_body|lower_body|unknown), "
         "garment_type(top|hoodie|pants|skirt|dress|set|unknown), model_gender(male|female|unknown), "
         "fit_notes(regular|fitted|boxy|oversized|baggy|jorts|loose|unknown plus short garment-specific notes), "
         "pose_notes, product_side(front|back|unknown), confidence."
@@ -302,6 +315,7 @@ def classify(root: Path, tasks: list[dict[str, Any]], api_key: str | None, visio
             "same_person_base": "",
             "same_person_targets": [],
             "eagle_base": "",
+            "source_qc": {},
             "eagle_selection": {
                 "path": "",
                 "search_tags": [],
@@ -459,7 +473,7 @@ def model_ref_for_angle(class_info: dict[str, Any], sku_dir: Path, angle: str) -
 
 def flat_for(class_info: dict[str, Any], sku_dir: Path, angle: str) -> Path:
     key = "back_flat" if angle == "back" else "front_flat"
-    name = class_info.get(key) or class_info.get("front_flat")
+    name = class_info.get(key)
     if not name:
         raise FileNotFoundError(f"Missing {key} in AIGC视觉识别.json")
     return path_by_name(sku_dir, name)
@@ -467,7 +481,7 @@ def flat_for(class_info: dict[str, Any], sku_dir: Path, angle: str) -> Path:
 
 def back_angle_refs(class_info: dict[str, Any], sku_dir: Path) -> list[Path]:
     model = model_ref_for_angle(class_info, sku_dir, "front") or model_ref_for_angle(class_info, sku_dir, "side") or model_ref_for(class_info, sku_dir)
-    return [model, flat_for(class_info, sku_dir, "front"), flat_for(class_info, sku_dir, "back")]
+    return [model, flat_for(class_info, sku_dir, "back")]
 
 
 def eagle_base_for(class_info: dict[str, Any], garment: str = "", fit_notes: str = "") -> Path:
@@ -544,14 +558,27 @@ def custom_steps_for(class_info: dict[str, Any], sku_dir: Path) -> list[dict[str
             raise ValueError(f"custom_steps[{idx}] references unavailable prior output: {refs_from}")
         if not refs and not refs_from:
             raise ValueError(f"custom_steps[{idx}] needs refs or refs_from")
+        step_name = str(item.get("name") or item.get("output_name") or f"自定义修改{idx}")
+        target_scope = str(item.get("target_scope") or "").strip()
+        if "半身" in step_name:
+            if target_scope not in {"upper_body", "lower_body"}:
+                raise ValueError(f"custom_steps[{idx}] half-body output requires target_scope=upper_body|lower_body")
+            scope_terms = {
+                "upper_body": ("upper-body", "upper body", "上半身", "上身"),
+                "lower_body": ("lower-body", "lower body", "下半身", "下身"),
+            }
+            if not any(term in prompt.lower() for term in scope_terms[target_scope]):
+                raise ValueError(f"custom_steps[{idx}] prompt does not explicitly match target_scope={target_scope}")
         step = {
-            "name": str(item.get("name") or f"自定义修改{idx}"),
+            "name": step_name,
             "kind": str(item.get("kind") or "custom"),
             "refs": refs,
             "prompt": prompt,
             "intermediate": bool(item.get("intermediate", idx < len(planned))),
         }
-        for key in ("refs_from", "flat_angle", "extra_flat_angles", "sets", "move_color_refs"):
+        if target_scope:
+            step["target_scope"] = target_scope
+        for key in ("refs_from", "flat_angle", "extra_flat_angles", "sets", "move_color_refs", "reference_roles"):
             if item.get(key):
                 step[key] = item[key]
         output_key = str(step.get("sets") or "").strip()
@@ -585,6 +612,47 @@ def validate_product_first_dependencies(steps: list[dict[str, Any]]) -> None:
         raise ValueError("Product work was requested but no product-correction step was planned")
 
 
+def validate_back_reference_contract(steps: list[dict[str, Any]]) -> None:
+    for idx, step in enumerate(steps, 1):
+        if step.get("kind") != "angle_back":
+            continue
+        extra_angles = list(step.get("extra_flat_angles") or [])
+        if "front" in extra_angles:
+            raise ValueError(f"Step {idx} (angle_back) must not include the front flat lay")
+        roles = {str(role).strip().lower() for role in step.get("reference_roles") or []}
+        if "front_flat" in roles or "product_front" in roles:
+            raise ValueError(f"Step {idx} (angle_back) must use only the model source and back flat lay")
+
+
+def validate_pants_source_plan(class_info: dict[str, Any], steps: list[dict[str, Any]]) -> None:
+    if garment_word(class_info) != "pants":
+        return
+    source_qc = class_info.get("source_qc") or {}
+    if not isinstance(source_qc, dict):
+        raise ValueError("source_qc must be an object keyed by source filename")
+    product_kinds = {"color", "try_on", "product_edit", "garment_replace"}
+    for idx, step in enumerate(steps, 1):
+        for ref in step.get("refs", []):
+            name = Path(ref).name
+            record = source_qc.get(name) or source_qc.get(str(ref))
+            if not isinstance(record, dict):
+                if step.get("kind") not in product_kinds:
+                    raise ValueError(f"Step {idx} reuses unverified pants source {name}; add source_qc or schedule product try-on first")
+                continue
+            waist = str(record.get("waist_accessory") or "").strip().lower()
+            footwear = str(record.get("footwear_type") or "").strip().lower()
+            placement = str(record.get("pant_leg_placement") or "").strip().lower()
+            passed = record.get("manual_verified") is True and record.get("product_accurate") is True
+            if waist not in {"none", "product_integrated", "无", "产品自带"}:
+                passed = False
+            if footwear in {"boots", "boot", "high_top", "high-top", "靴子", "高帮鞋"} and placement not in {
+                "outside_shafts", "outside", "鞋筒外", "自然垂在鞋筒外"
+            }:
+                passed = False
+            if not passed and step.get("kind") not in product_kinds:
+                raise ValueError(f"Step {idx} reuses pants source {name} that failed waist/footwear/product visual QC; schedule product try-on first")
+
+
 def build_steps(task: dict[str, Any], class_info: dict[str, Any], image_model: str = "") -> list[dict[str, Any]]:
     sku = task["sku"]
     sku_dir = Path(task["sku_dir"])
@@ -594,6 +662,8 @@ def build_steps(task: dict[str, Any], class_info: dict[str, Any], image_model: s
     custom_steps = custom_steps_for(class_info, sku_dir)
     if custom_steps:
         validate_product_first_dependencies(custom_steps)
+        validate_back_reference_contract(custom_steps)
+        validate_pants_source_plan(class_info, custom_steps)
         for step in custom_steps:
             validate_generation_prompt(step["prompt"], sku)
         return custom_steps
@@ -631,7 +701,7 @@ def build_steps(task: dict[str, Any], class_info: dict[str, Any], image_model: s
         if "side" in requested_angles:
             steps.append({"name": "缺失模特侧面图", "kind": "angle_side", "refs_from": "accurate_front", "prompt": prompt_for("angle_side", garment, image_model=image_model), "sets": "accurate_side", "source_modification": "；".join(items)})
         if "back" in requested_angles:
-            steps.append({"name": "缺失模特背面图", "kind": "angle_back", "refs_from": "accurate_front", "extra_flat_angles": ["front", "back"], "prompt": prompt_for("angle_back", garment, image_model=image_model), "sets": "accurate_back", "source_modification": "；".join(items)})
+            steps.append({"name": "缺失模特背面图", "kind": "angle_back", "refs_from": "accurate_front", "extra_flat_angles": ["back"], "prompt": prompt_for("angle_back", garment, image_model=image_model), "sets": "accurate_back", "source_modification": "；".join(items)})
         for idx, item in enumerate(pose_items, 1):
             steps.append({"name": f"模特姿势更改{idx}", "kind": "pose", "refs_from": "accurate_front", "prompt": prompt_for("pose", garment, image_model=image_model), "sets": f"pose_{idx}", "source_modification": item})
     else:
@@ -688,7 +758,7 @@ def build_steps(task: dict[str, Any], class_info: dict[str, Any], image_model: s
             else:
                 step["refs"] = [base_ref]
             if angle == "back":
-                step["extra_flat_angles"] = ["front", "back"]
+                step["extra_flat_angles"] = ["back"]
             steps.append(step)
 
         pose_targets = class_info.get("pose_targets") or [str(base_ref.name)]
@@ -707,6 +777,8 @@ def build_steps(task: dict[str, Any], class_info: dict[str, Any], image_model: s
     if not steps:
         raise ValueError("No executable steps were produced; add visually planned custom_steps")
     validate_product_first_dependencies(steps)
+    validate_back_reference_contract(steps)
+    validate_pants_source_plan(class_info, steps)
     for step in steps:
         validate_generation_prompt(step["prompt"], sku)
     return steps
@@ -776,7 +848,81 @@ def generate_image(prompt: str, refs: list[Path], api_key: str, model: str) -> d
     result = payload
     if task_id and not collect_result_urls(payload) and status not in {"succeeded", "success", "completed", "complete"}:
         result = poll_task(task_id, api_key)
+    result_status = str(result.get("status", "")).lower() if isinstance(result, dict) else ""
+    if result_status in {"failed", "error", "cancelled"}:
+        raise TerminalGenerationError(result)
     return {"uploads": uploads, "request": body, "initial": payload, "result": result}
+
+
+def generate_image_with_retry(
+    prompt: str,
+    refs: list[Path],
+    api_key: str,
+    model: str,
+    log_path: Path,
+) -> tuple[dict[str, Any], int]:
+    """Retry only confirmed provider-side terminal failures.
+
+    Transport requests already use their own initial attempt plus two retries.
+    Retrying an ambiguous submit/poll failure here could duplicate a paid task.
+    """
+    for attempt in range(1, GENERATION_ATTEMPTS + 1):
+        try:
+            return generate_image(prompt, refs, api_key, model), attempt
+        except TerminalGenerationError as exc:
+            append_log(log_path, {
+                "time": now(),
+                "event": "primary_generation_terminal_failure",
+                "model": model,
+                "attempt": attempt,
+                "total_attempts": GENERATION_ATTEMPTS,
+                "provider_response": exc.payload,
+            })
+            if attempt >= GENERATION_ATTEMPTS:
+                raise
+            time.sleep(2 * attempt)
+    raise AssertionError("unreachable")
+
+
+def write_fallback_request(
+    process_dir: Path,
+    task: dict[str, Any],
+    step: dict[str, Any],
+    step_index: int,
+    refs: list[Path],
+    out_base: Path,
+    primary_model: str,
+    error: Exception,
+) -> Path:
+    path = process_dir / "AIGC生图回退请求.json"
+    payload = {"version": 1, "requests": []}
+    if path.exists():
+        try:
+            current = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(current, dict) and isinstance(current.get("requests"), list):
+                payload = current
+        except Exception:
+            pass
+    request_id = f"{task['sku']}:{step_index}:{step.get('name', 'unknown')}"
+    entry = {
+        "id": request_id,
+        "status": "pending_builtin_imagegen",
+        "created_at": now(),
+        "reason": repr(error),
+        "primary_model": primary_model,
+        "primary_generation_attempts": GENERATION_ATTEMPTS,
+        "request_attempts_per_http_call": REQUEST_ATTEMPTS,
+        "fallback_chain": ["builtin_imagegen", f"toapis:{GEMINI_FALLBACK_MODEL}"],
+        "prompt": step["prompt"],
+        "reference_images": [str(ref) for ref in refs],
+        "output_base": str(out_base),
+        "size": SIZE,
+        "resolution": RESOLUTION,
+    }
+    payload["requests"] = [item for item in payload["requests"] if item.get("id") != request_id]
+    payload["requests"].append(entry)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
 
 
 def save_outputs(result: dict[str, Any], out_base: Path) -> list[str]:
@@ -888,6 +1034,10 @@ def process_sku(task: dict[str, Any], class_info: dict[str, Any], api_key: str, 
         record["status"] = "planned"
         return record
     for idx, step in enumerate(steps, 1):
+        refs: list[Path] = []
+        out_parent = process_dir if step.get("intermediate") else sku_dir
+        out_base = out_parent / f"AIGC+{sanitize_name(step['name'])}+{idx}"
+        generation_started = False
         try:
             refs = list(step.get("refs", []))
             if "refs_from" in step:
@@ -896,12 +1046,13 @@ def process_sku(task: dict[str, Any], class_info: dict[str, Any], api_key: str, 
                     refs.append(flat_for(class_info, sku_dir, extra_angle))
                 if step.get("flat_angle"):
                     refs.append(flat_for(class_info, sku_dir, step["flat_angle"]))
-            out_parent = process_dir if step.get("intermediate") else sku_dir
-            out_base = out_parent / f"AIGC+{sanitize_name(step['name'])}+{idx}"
             append_log(log_path, {"time": now(), "event": "subtask_start", "step": step, "output_base": str(out_base), "prompt": step["prompt"], "reference_images": [str(r) for r in refs]})
-            result = generate_image(step["prompt"], refs, api_key, model)
+            generation_started = True
+            result, primary_attempts = generate_image_with_retry(
+                step["prompt"], refs, api_key, model, log_path
+            )
             saved = save_outputs(result, out_base)
-            append_log(log_path, {"time": now(), "event": "generation_result", "result": result, "saved_outputs": saved})
+            append_log(log_path, {"time": now(), "event": "generation_result", "result": result, "saved_outputs": saved, "primary_attempts": primary_attempts})
             if not saved:
                 raise RuntimeError("generation completed but no output image was found")
             record["outputs"].extend(saved)
@@ -916,8 +1067,36 @@ def process_sku(task: dict[str, Any], class_info: dict[str, Any], api_key: str, 
                 if ref_path.parent == sku_dir and ref_path.name.startswith("AIGC+") is False:
                     color_refs_to_move.add(ref_path)
         except Exception as exc:
-            record["errors"].append({"step": step.get("name"), "error": repr(exc)})
-            append_log(log_path, {"time": now(), "event": "subtask_error", "step": step, "error": repr(exc)})
+            if generation_started:
+                fallback_request = write_fallback_request(
+                    process_dir, task, step, idx, refs, out_base, model, exc
+                )
+                error_record = {
+                    "step": step.get("name"),
+                    "error": repr(exc),
+                    "fallback_status": "pending_builtin_imagegen",
+                    "fallback_request": str(fallback_request),
+                }
+                record["errors"].append(error_record)
+                append_log(log_path, {
+                    "time": now(),
+                    "event": "fallback_required",
+                    "step": step,
+                    "error": repr(exc),
+                    "prompt": step["prompt"],
+                    "reference_images": [str(r) for r in refs],
+                    "output_base": str(out_base),
+                    "fallback_request": str(fallback_request),
+                    "fallback_chain": ["builtin_imagegen", f"toapis:{GEMINI_FALLBACK_MODEL}"],
+                })
+            else:
+                record["errors"].append({"step": step.get("name"), "error": repr(exc)})
+                append_log(log_path, {
+                    "time": now(),
+                    "event": "subtask_error",
+                    "step": step,
+                    "error": repr(exc),
+                })
     moved_refs = []
     if not record["errors"]:
         for ref_path in sorted(color_refs_to_move, key=lambda p: p.name):
